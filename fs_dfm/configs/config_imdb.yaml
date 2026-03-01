@@ -1,0 +1,86 @@
+# FS-DFM IMDB Sentiment Classification Fine-tuning Config
+#
+# Reference config for fine-tuning on IMDB with three loss modes.
+# train_classifier.py is argparse-based (does NOT use Hydra).
+#
+# Example commands:
+#
+#   # Mode 1: Cross-entropy (simplest, start here)
+#   python train_classifier.py --checkpoint_path /path/to/checkpoint.pth \
+#       --loss_mode cross_entropy --lr 5e-6 --num_iters 10000
+#
+#   # Mode 2: Generalized KL (g(t)-weighted, more principled)
+#   python train_classifier.py --checkpoint_path /path/to/checkpoint.pth \
+#       --loss_mode generalized_kl --lr 5e-6 --num_iters 10000
+#
+#   # Mode 3: Full distillation (teacher-student + RK-4 + budget-aware blending)
+#   python train_classifier.py --checkpoint_path /path/to/checkpoint.pth \
+#       --loss_mode distillation --lr 1e-5 --num_iters 20000 \
+#       --ema_decay 0.9995 --distill_th 0.00195
+
+# Model architecture (must match the pre-trained checkpoint)
+model:
+  hidden_size: 768
+  cond_dim: 128
+  length: 512       # shorter than pre-training (1024) to save memory; sufficient for IMDB
+  n_blocks: 12
+  n_heads: 12
+  dropout: 0.1
+
+# Training
+training:
+  batch_size: 16
+  seed: 42
+  precision: bf16
+
+# Optimizer
+optim:
+  optimizer: AdamW
+  lr: 5e-6           # 10x lower than pre-training LR for fine-tuning
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1e-8
+  weight_decay: 0.03
+  warmup: 500
+  grad_clip: 1.0
+  eta_min_ratio: 0.1
+  n_iters: 10000     # ~4 epochs over 25k IMDB train samples
+
+# Flow matching
+flow:
+  source_distribution: mask
+  scheduler_type: polynomial
+  exponent: 1.0
+
+  # Loss mode: cross_entropy | generalized_kl | distillation
+  loss_mode: cross_entropy
+
+  # Distillation-specific (only used when loss_mode=distillation)
+  student_solver: mixture_euler_with_cumulative_scalar
+  sampling_steps: 1024
+  distill_th: 0.00195   # 1/513 — threshold for budget-aware blending
+  can_apply_dt: true
+  step_sizes: [1.0, 5e-1, 2.5e-1, 1.25e-1, 6.25e-2, 3.125e-2, 1.5625e-2, 7.8125e-3, 3.90625e-3, 1.953125e-3, 9.765625e-4]
+  dt_weights:  [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+
+# EMA (distillation mode only)
+ema:
+  decay: 0.9995
+  freq: 1
+
+# Logging
+logging:
+  log_freq: 100
+  save_freq: 2000
+  enable_wandb: true
+  wandb_project: fs-dfm-imdb
+  wandb_entity: null          # your W&B username or team
+  wandb_group: null
+  wandb_run_name: null        # auto-generated if null
+
+# Inference
+inference:
+  method: logits              # "logits" (fast) or "sampling" (uses sample_masked)
+  time_value: 0.95            # diffusion time for logits method
+  sampling_steps: 64          # steps for sampling method
+  batch_size: 32
