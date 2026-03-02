@@ -462,6 +462,21 @@ def train_step_distillation(
     return loss, metrics
 
 
+def enable_gradient_checkpointing(model):
+    """Patch Transformer blocks to use gradient checkpointing (no source changes)."""
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    for block in model.blocks:
+        orig_forward = block.forward
+
+        def _make_ckpt_fn(fn):
+            def _ckpt_forward(*args, **kwargs):
+                return torch_checkpoint(fn, *args, use_reentrant=False, **kwargs)
+            return _ckpt_forward
+
+        block.forward = _make_ckpt_fn(orig_forward)
+
+
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
@@ -521,6 +536,10 @@ def train(args):
         else:
             print("WARNING: No checkpoint loaded. Training from scratch.")
 
+        if args.gradient_checkpointing:
+            enable_gradient_checkpointing(model)
+            print("Gradient checkpointing enabled")
+
         if args.compile:
             model = torch.compile(model)
             print("Model compiled with torch.compile")
@@ -570,6 +589,10 @@ def train(args):
         student_ema_model = copy.deepcopy(student_model)
         student_ema_model.requires_grad_(False)
         student_ema_model.eval()
+
+        if args.gradient_checkpointing:
+            enable_gradient_checkpointing(student_model)
+            print("Gradient checkpointing enabled on student model")
 
         if args.compile:
             teacher_model = torch.compile(teacher_model)
@@ -849,6 +872,8 @@ def main():
     # Misc
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Recompute activations during backward to reduce GPU memory")
     parser.add_argument("--log_freq", type=int, default=100)
     parser.add_argument("--save_freq", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
