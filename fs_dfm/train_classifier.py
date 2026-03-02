@@ -8,14 +8,20 @@
 #                     with budget-aware blending (teacher + student + EMA)
 #
 # Usage:
+#   # With YAML config (CLI args override YAML values):
+#   python train_classifier.py \
+#       --config configs/config_imdb.yaml \
+#       --checkpoint_path /path/to/pretrained/checkpoint.pth
+#
+#   # Without config (all defaults from argparse):
 #   python train_classifier.py \
 #       --checkpoint_path /path/to/pretrained/checkpoint.pth \
-#       --output_dir ./imdb_finetuned \
-#       --loss_mode cross_entropy \
-#       --batch_size 16 \
-#       --lr 5e-6 \
-#       --num_iters 10000 \
-#       --block_size 512
+#       --loss_mode cross_entropy --lr 5e-6 --num_iters 10000
+#
+#   # Config + CLI override:
+#   python train_classifier.py \
+#       --config configs/config_imdb.yaml \
+#       --checkpoint_path /path/to/ckpt --lr 1e-4 --batch_size 32
 #
 
 import argparse
@@ -24,6 +30,8 @@ import math
 import os
 import sys
 from pathlib import Path
+
+import yaml
 
 import torch
 import torch.nn as nn
@@ -51,6 +59,62 @@ from flow_matching.loss.KL_divergence import ForwardKLDistillationLoss
 # Solver (needed for distillation mode)
 from flow_matching.solver import get_solver_by_name
 from flow_matching.utils import ModelWrapper
+
+
+# ---------------------------------------------------------------------------
+# YAML config loading
+# ---------------------------------------------------------------------------
+
+# Maps YAML nested keys to argparse names where they differ
+_YAML_RENAME = {
+    "length": "block_size",       # model.length -> --block_size
+    "n_iters": "num_iters",       # optim.n_iters -> --num_iters
+}
+
+# Keys from YAML sections that need a prefix to match argparse names
+_YAML_PREFIX = {
+    "ema": {"decay": "ema_decay", "freq": "ema_freq"},
+}
+
+# YAML keys to skip (no corresponding argparse arg)
+# _YAML_SKIP = {"optimizer", "source_distribution", "scheduler_type", "exponent"}
+_YAML_SKIP = {}
+# YAML sections to skip entirely (inference config belongs to classify_imdb.py)
+# _YAML_SKIP_SECTIONS = {"inference"}
+_YAML_SKIP_SECTIONS = {}
+
+
+def load_yaml_config(path):
+    """Load a YAML config file and flatten its nested structure to argparse-compatible dict.
+
+    Returns a flat dict mapping argparse dest names to values.
+    """
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+
+    flat = {}
+    for section, values in cfg.items():
+        if not isinstance(values, dict) or section in _YAML_SKIP_SECTIONS:
+            continue
+        # Check if this section has special prefix mappings
+        prefix_map = _YAML_PREFIX.get(section, {})
+        for key, val in values.items():
+            if key in _YAML_SKIP:
+                continue
+            # Apply prefix mapping first, then rename mapping, else use raw key
+            if key in prefix_map:
+                arg_name = prefix_map[key]
+            elif key in _YAML_RENAME:
+                arg_name = _YAML_RENAME[key]
+            else:
+                arg_name = key
+            # Coerce list elements for known numeric-list args
+            if arg_name == "step_sizes" and isinstance(val, list):
+                val = [float(x) for x in val]
+            elif arg_name == "dt_weights" and isinstance(val, list):
+                val = [int(x) for x in val]
+            flat[arg_name] = val
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +484,12 @@ def train(args):
         )
 
     # Tokenizer
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer = GPT2TokenizerFast.from_pretrained(args.tokenizer_path)
     vocab_size = tokenizer.vocab_size
     print(f"Vocab size: {vocab_size}")
 
     # Source distribution and flow path
-    source_distribution = get_source_distribution("mask", vocab_size)
+    source_distribution = get_source_distribution(args.source_distribution, vocab_size)
     path = get_path(scheduler_type="polynomial", exponent=1.0)
 
     # Model config
@@ -443,16 +507,17 @@ def train(args):
         # Teacher-only: single model, dt_conditioned=False
         model = Transformer(
             config=model_config,
+            # vocab_size=vocab_size + 1 if args.source_distribution == "mask" else vocab_size,
             vocab_size=vocab_size,
-            masked=True,
-            dt_conditioned=False,
+            masked=args.source_distribution == "mask",
+            dt_conditioned=args.dt_conditioned,
         ).to(device)
 
         num_params = sum(p.numel() for p in model.parameters())
         print(f"Model parameters: {num_params / 1e6:.1f}M")
 
         if args.checkpoint_path and os.path.exists(args.checkpoint_path):
-            load_pretrained_weights(args.checkpoint_path, model, device)
+            load_pretrained_weights(args.checkpoint_path, model, device, key_preference=["student_model"])
         else:
             print("WARNING: No checkpoint loaded. Training from scratch.")
 
@@ -491,7 +556,7 @@ def train(args):
             # Load into student (strict=False because student has extra dt-related params)
             load_pretrained_weights(
                 args.checkpoint_path, student_model, device,
-                key_preference=["student_model", "teacher_model", "model"],
+                key_preference=["student_model", "teacher_model"],
             )
         else:
             print("WARNING: No checkpoint loaded. Training from scratch.")
@@ -577,10 +642,6 @@ def train(args):
     best_loss = float("inf")
     data_iter = iter(train_loader)
 
-    # Step sizes for distillation mode
-    step_sizes = [1.0, 5e-1, 2.5e-1, 1.25e-1, 6.25e-2, 3.125e-2, 1.5625e-2, 7.8125e-3, 3.90625e-3, 1.953125e-3, 9.765625e-4]
-    dt_weights = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-
     print(f"\nStarting training for {args.num_iters} iterations...")
     print(f"  Loss mode: {args.loss_mode}")
     print(f"  Batch size: {args.batch_size}")
@@ -622,8 +683,8 @@ def train(args):
                 source_distribution=source_distribution,
                 path=path,
                 solver=solver,
-                step_sizes=step_sizes,
-                dt_weights=dt_weights,
+                step_sizes=args.step_sizes,
+                dt_weights=args.dt_weights,
                 sampling_steps=args.sampling_steps,
                 vocab_size=vocab_size,
                 distill_th=args.distill_th,
@@ -719,6 +780,10 @@ def train(args):
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune FS-DFM for IMDB classification")
 
+    # Config file (YAML defaults, overridden by CLI args)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file (CLI args override YAML values)")
+
     # Paths
     parser.add_argument("--checkpoint_path", type=str, default="",
                         help="Path to pre-trained FS-DFM checkpoint")
@@ -764,6 +829,13 @@ def main():
                         help="Threshold for budget-aware blending: dt < th → L_dfm, dt >= th → L_dist")
     parser.add_argument("--can_apply_dt", type=bool, default=True,
                         help="Whether to apply dt scaling in generator computation")
+    parser.add_argument("--step_sizes", type=float, nargs="+",
+                        default=[1.0, 5e-1, 2.5e-1, 1.25e-1, 6.25e-2, 3.125e-2,
+                                 1.5625e-2, 7.8125e-3, 3.90625e-3, 1.953125e-3, 9.765625e-4],
+                        help="Step sizes for distillation dt schedule")
+    parser.add_argument("--dt_weights", type=int, nargs="+",
+                        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
+                        help="Weights for sampling dt values")
     parser.add_argument("--ema_decay", type=float, default=0.9995,
                         help="EMA decay rate for student EMA model")
     parser.add_argument("--ema_freq", type=int, default=1,
@@ -792,6 +864,12 @@ def main():
                         help="W&B group for organizing runs")
     parser.add_argument("--wandb_run_name", type=str, default=None,
                         help="W&B run name (auto-generated if not set)")
+
+    # Two-pass parsing: first extract --config, then override defaults from YAML
+    preliminary, _ = parser.parse_known_args()
+    if preliminary.config is not None:
+        yaml_defaults = load_yaml_config(preliminary.config)
+        parser.set_defaults(**yaml_defaults)
 
     args = parser.parse_args()
 

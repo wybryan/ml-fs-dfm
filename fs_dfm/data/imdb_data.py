@@ -6,7 +6,7 @@
 # or "negative", for generative classification with a diffusion model.
 #
 
-
+import os
 from typing import Optional
 
 import torch
@@ -14,6 +14,7 @@ from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import GPT2TokenizerFast
 
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # for easier debugging of CUDA errors
 
 # Template tokens appended after the review text
 SENTIMENT_PREFIX = " Sentiment:"
@@ -66,7 +67,15 @@ class IMDBClassificationDataset(Dataset):
         self.max_review_len = block_size - self.overhead
 
         # Load IMDB
-        ds = load_dataset("imdb", split=split, cache_dir=cache_dir)
+        ds = load_dataset(
+            "json",
+            split=split,
+            data_files={
+                "train": os.path.join(cache_dir, "train.jsonl"),
+                "test": os.path.join(cache_dir, "test.jsonl")
+            },
+            cache_dir=cache_dir,
+        )
         if max_samples is not None:
             ds = ds.select(range(min(len(ds), max_samples)))
         self.data = ds

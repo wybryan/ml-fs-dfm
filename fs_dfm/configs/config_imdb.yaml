@@ -18,14 +18,23 @@
 #       --loss_mode distillation --lr 1e-5 --num_iters 20000 \
 #       --ema_decay 0.9995 --distill_th 0.00195
 
+
+path_dir:
+  checkpoint_path: /vepfs/jinke/models/FS-DFM/checkpoint_step_190000.pth
+  cache_dir: /vepfs/jinke/bw-data/ml-fs-dfm/datasets/imdb
+  output_dir: outputs/imdb_finetune
+  tokenizer_path: /vepfs/jinke/bw-data/ml-fs-dfm/models/gpt2
+
+
 # Model architecture (must match the pre-trained checkpoint)
 model:
-  hidden_size: 768
-  cond_dim: 128
-  length: 512       # shorter than pre-training (1024) to save memory; sufficient for IMDB
-  n_blocks: 12
-  n_heads: 12
+  hidden_size: 2048
+  cond_dim: 256
+  n_heads: 32
+  n_blocks: 21
   dropout: 0.1
+  length: 1024
+  compile: false
 
 # Training
 training:
@@ -48,9 +57,11 @@ optim:
 
 # Flow matching
 flow:
-  source_distribution: mask
+  dt_conditioned: true
+  source_distribution: uniform
   scheduler_type: polynomial
   exponent: 1.0
+
 
   # Loss mode: cross_entropy | generalized_kl | distillation
   loss_mode: cross_entropy
@@ -72,7 +83,7 @@ ema:
 logging:
   log_freq: 100
   save_freq: 2000
-  enable_wandb: true
+  enable_wandb: false
   wandb_project: fs-dfm-imdb
   wandb_entity: null          # your W&B username or team
   wandb_group: null
