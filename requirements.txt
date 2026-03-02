@@ -19,5 +19,6 @@ hydra-submitit-launcher
 datasets
 transformers
 wandb
+accelerate
 einops
 flow_matching
