@@ -41,6 +41,7 @@ training:
   batch_size: 16
   seed: 42
   precision: bf16
+  gradient_accumulation_steps: 10
 
 # Optimizer
 optim:
@@ -57,7 +58,7 @@ optim:
 
 # Flow matching
 flow:
-  dt_conditioned: true
+  dt_conditioned: false
   source_distribution: uniform
   scheduler_type: polynomial
   exponent: 1.0
