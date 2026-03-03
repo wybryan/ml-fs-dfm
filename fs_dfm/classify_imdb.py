@@ -20,7 +20,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import GPT2TokenizerFast
+from transformers import GPT2Tokenizer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -39,12 +39,12 @@ def load_model(checkpoint_path, model_config, vocab_size, device):
     model = Transformer(
         config=model_config,
         vocab_size=vocab_size,
-        masked=True,
+        masked=False,
         dt_conditioned=False,
     ).to(device)
 
     loaded = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    for key in ["teacher_model", "model"]:
+    for key in ["teacher_model"]:
         if key in loaded:
             model.load_state_dict(loaded[key], strict=False)
             print(f"Loaded model from key '{key}'")
@@ -62,6 +62,7 @@ def classify_with_logits(
     pos_token_id: int,
     neg_token_id: int,
     time_value: float = 0.95,
+    source_distribution=None,
 ) -> torch.Tensor:
     """
     Single forward pass classification.
@@ -86,7 +87,13 @@ def classify_with_logits(
     device = input_ids.device
 
     time = torch.full((B,), time_value, device=device)
-    logits = model(x_t=input_ids, time=time)  # [B, L, vocab_size+1]
+    x_0 = source_distribution.sample_like(input_ids)
+    x_0 = torch.where(
+        torch.arange(x_0.shape[1], device=x_0.device)[None, :] < label_token_pos[:, None],
+        input_ids,
+        x_0
+    )
+    logits = model(x_t=x_0, time=time)  # [B, L, vocab_size+1]
 
     # Extract logits at label positions
     predictions = []
@@ -172,7 +179,7 @@ def classify_with_sampling(
 
 def build_masked_sequences(
     texts: List[str],
-    tokenizer: GPT2TokenizerFast,
+    tokenizer: GPT2Tokenizer,
     vocab_size: int,
     block_size: int,
 ):
@@ -221,6 +228,8 @@ def evaluate_imdb(
     max_samples=None,
     vocab_size=None,
     path=None,
+    source_distribution=None,
+    dataset_dir=None
 ):
     """Evaluate on the full IMDB test set."""
     vocab_size = vocab_size or tokenizer.vocab_size
@@ -235,6 +244,7 @@ def evaluate_imdb(
         block_size=block_size,
         tokenizer=tokenizer,
         max_samples=max_samples,
+        cache_dir=dataset_dir,
     )
     print(f"Evaluating on {len(test_ds)} test samples with method='{method}'")
 
@@ -260,6 +270,7 @@ def evaluate_imdb(
             preds = classify_with_logits(
                 model, input_ids, label_token_pos,
                 pos_token_id, neg_token_id, time_value,
+                source_distribution=source_distribution,
             )
         elif method == "sampling":
             preds = classify_with_sampling(
@@ -292,29 +303,29 @@ def evaluate_imdb(
 def main():
     parser = argparse.ArgumentParser(description="IMDB Classification with FS-DFM")
 
-    parser.add_argument("--checkpoint_path", type=str, required=True)
+    parser.add_argument("--checkpoint_path", default="/vepfs/jinke/bw-data/ml-fs-dfm/outputs/imdb_ft_ddp/checkpoint_step_8000.pth", type=str)
     parser.add_argument("--method", type=str, default="logits",
                         choices=["logits", "sampling"])
-    parser.add_argument("--block_size", type=int, default=512)
+    parser.add_argument("--block_size", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--time_value", type=float, default=0.95,
                         help="Diffusion time for logits method (0.9-0.99)")
-    parser.add_argument("--sampling_steps", type=int, default=64,
+    parser.add_argument("--sampling_steps", type=int, default=10,
                         help="Number of denoising steps for sampling method")
-    parser.add_argument("--max_samples", type=int, default=None,
+    parser.add_argument("--max_samples", type=int, default=1000,
                         help="Max test samples (None=all 25k)")
 
     # Model config
-    parser.add_argument("--hidden_size", type=int, default=768)
-    parser.add_argument("--cond_dim", type=int, default=128)
-    parser.add_argument("--n_blocks", type=int, default=12)
-    parser.add_argument("--n_heads", type=int, default=12)
+    parser.add_argument("--hidden_size", type=int, default=2048)
+    parser.add_argument("--cond_dim", type=int, default=256)
+    parser.add_argument("--n_blocks", type=int, default=21)
+    parser.add_argument("--n_heads", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer = GPT2Tokenizer.from_pretrained("/vepfs/jinke/bw-data/ml-fs-dfm/models/gpt2")
     vocab_size = tokenizer.vocab_size
 
     model_config = {
@@ -329,6 +340,7 @@ def main():
     model = load_model(args.checkpoint_path, model_config, vocab_size, device)
 
     path = get_path(scheduler_type="polynomial", exponent=1.0)
+    source_distribution = get_source_distribution("uniform", vocab_size)
 
     evaluate_imdb(
         model=model,
@@ -342,6 +354,8 @@ def main():
         max_samples=args.max_samples,
         vocab_size=vocab_size,
         path=path,
+        source_distribution=source_distribution,
+        dataset_dir="/vepfs/jinke/bw-data/ml-fs-dfm/datasets/imdb",
     )
 
 
