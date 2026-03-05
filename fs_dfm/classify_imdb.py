@@ -115,13 +115,18 @@ def classify_with_sampling(
     neg_token_id: int,
     vocab_size: int,
     path,
+    source_distribution=None,
     sampling_steps: int = 64,
 ) -> torch.Tensor:
     """
     Iterative sampling classification using sample_masked().
 
-    Starts from the input sequence (review=clean, label=MASK), runs the
+    Starts from the input sequence (review=clean, label=noised), runs the
     diffusion sampling process, and reads the generated token at the label position.
+
+    Supports both mask and uniform source distributions:
+      - Mask source: label position starts as mask token (vocab_size).
+      - Uniform source: label position starts as a random token from [0, vocab_size).
 
     Args:
         model: Fine-tuned FS-DFM teacher model.
@@ -131,6 +136,7 @@ def classify_with_sampling(
         neg_token_id: Token ID for " negative".
         vocab_size: Base vocab size (mask token = vocab_size).
         path: MixtureDiscreteProbPath for the solver.
+        source_distribution: SourceDistribution instance (mask or uniform).
         sampling_steps: Number of denoising steps.
 
     Returns:
@@ -144,18 +150,25 @@ def classify_with_sampling(
     for i in range(B):
         edit_mask[i, label_token_pos[i].item()] = True
 
+    # For uniform source, replace label positions with random tokens
+    x_init = input_ids.clone()
+    is_masked = source_distribution is None or source_distribution.masked
+    if not is_masked:
+        noise = source_distribution.sample_like(input_ids)
+        x_init = torch.where(edit_mask, noise, x_init)
+
     # Wrap model to output probabilities (solver expects softmax output)
     wrapped_model = WrappedModel(model=model)
 
     solver = MixtureDiscreteEulerSolver(
         model=wrapped_model,
         path=path,
-        vocabulary_size=vocab_size + 1,  # +1 for mask token
+        vocabulary_size=vocab_size if not is_masked else vocab_size + 1,
     )
 
     step_size = 1.0 / sampling_steps
     result = solver.sample_masked(
-        x_init=input_ids,
+        x_init=x_init,
         step_size=step_size,
         edit_mask=edit_mask,
         time_grid=torch.tensor([0.0, 1.0]),
@@ -171,7 +184,6 @@ def classify_with_sampling(
         elif generated_token == neg_token_id:
             predictions.append(0)
         else:
-            # Model generated an unexpected token — fall back to logit comparison
             predictions.append(-1)
 
     return torch.tensor(predictions, device=device)
@@ -275,7 +287,9 @@ def evaluate_imdb(
         elif method == "sampling":
             preds = classify_with_sampling(
                 model, input_ids, label_token_pos,
-                pos_token_id, neg_token_id, vocab_size, path, sampling_steps,
+                pos_token_id, neg_token_id, vocab_size, path,
+                source_distribution=source_distribution,
+                sampling_steps=sampling_steps,
             )
         else:
             raise ValueError(f"Unknown method: {method}")
@@ -304,7 +318,7 @@ def main():
     parser = argparse.ArgumentParser(description="IMDB Classification with FS-DFM")
 
     parser.add_argument("--checkpoint_path", default="/vepfs/jinke/bw-data/ml-fs-dfm/outputs/imdb_ft_ddp/checkpoint_step_8000.pth", type=str)
-    parser.add_argument("--method", type=str, default="logits",
+    parser.add_argument("--method", type=str, default="sampling",
                         choices=["logits", "sampling"])
     parser.add_argument("--block_size", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=32)
